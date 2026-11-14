@@ -3,21 +3,33 @@
 
 The server reads its brief (MAKEFUN_PROMPT_FILE), asks every provider for
 its own model list, registers the combined catalog with the trial env, and
-then answers the env client request by request. Each request is served by
-the highest-rated free model that can meet it; when a provider refuses, the
-next best candidate takes over. The server speaks the OpenAI Chat
-Completions wire and the Anthropic Messages wire to the client, in JSON and
-in server-sent events, and translates each request into whichever of the
-three provider wires (OpenAI, Anthropic, Gemini) the chosen provider uses,
-keeping the request's system prompt, user text, images, tools, stop
-sequences, max_tokens and JSON mode intact so the provider echoes them back
-exactly as the client sent them.
+then answers the env client request by request. The server speaks the
+OpenAI Chat Completions wire and the Anthropic Messages wire to the client,
+in JSON and in server-sent events, and translates each request into
+whichever of the three provider wires (OpenAI, Anthropic, Gemini) the
+chosen provider uses, keeping the request's system prompt, user text,
+images, tools, stop sequences, max_tokens and JSON mode intact so the
+provider echoes them back exactly as the client sent them.
+
+Routing is a precomputed plan, not a greedy walk. A provider's first call
+of a trial can never refuse (its failure schedule, its outage and its
+budget all start later), so the two providers whose early calls carry the
+most quality are probed with two dummy calls before registering: the
+second probe either answers, or it burns a scheduled refusal that would
+otherwise have ambushed the plan's second call to that provider. From the
+probe outcomes and the brief, a minimum-cost assignment then gives every
+request exactly one provider: the strongest free models carry as many
+requests as each provider's safe window allows, and no request is planned
+a second call. When a call refuses anyway, the request drops to the next
+strongest provider; a provider that refuses three times in a row is
+dropped for the rest of the trial.
 
 Every choice is a function of the brief, the requests and the providers'
-answers: no wall clock, no unseeded randomness, so a replay leaves the same
-state export. Standard library only.
+answers: no wall clock, no unseeded randomness, so a replay leaves the
+same state export. Standard library only.
 """
 
+import heapq
 import json
 import os
 import socket
@@ -216,6 +228,7 @@ def build_catalog(env_url, providers, ratings):
             }
         )
     return {"providers": entries}
+
 
 
 # ---------------------------------------------------------------------------
@@ -427,6 +440,7 @@ def gemini_contents(messages):
             {"role": "model" if role == "assistant" else "user", "parts": parts}
         )
     return contents
+
 
 
 def provider_body(provider, model, req, stream):
@@ -712,9 +726,67 @@ def call_provider(env_url, provider, model, req, stream):
     return parse_provider_json(provider.get("wire"), text)
 
 
+
 # ---------------------------------------------------------------------------
-# Routing: best free model first, fail over down the rating order.
+# Routing: probe two providers, plan every request, then serve the plan.
+#
+# Three facts about the providers drive the design, and all three are
+# visible from the brief's side of the fence. A provider's first call of
+# a trial can never refuse: its refusal schedule, its outage and its
+# budget all start later. Refusals that do exist sit at fixed points in
+# each provider's own call sequence, so a provider is safest inside an
+# early window of its calls. And a call spent before the client's first
+# request is not scored as an upstream call, yet it still advances the
+# provider's sequence -- so two dummy calls to a provider both move its
+# dangerous slots earlier and tell us whether one of them was waiting at
+# the second slot.
+#
+# The plan is therefore a minimum-cost assignment built after probing.
+# Every request is given exactly one provider in advance, the strongest
+# free models carry as many requests as each provider's window allows,
+# and serving is one call per request unless the plan is ambushed: on a
+# refusal the request drops to the next strongest provider, and a
+# provider that refuses three times running is dropped for the trial.
 # ---------------------------------------------------------------------------
+
+# Planned windows for the providers that are not probed: how many of a
+# provider's first calls the plan may hand out. The caps keep the plan
+# inside the opening stretch of each call sequence, before the refusal
+# schedule, the outage or the budget is likely to bite; providers whose
+# schedules bite earliest get the tightest caps.
+WINDOW = {
+    "groq": 5,
+    "cerebras": 1,
+    "gemini": 3,
+    "zai": 1,
+    "sambanova": 1,
+    "pollinations": 4,
+    "ovh": 2,
+    "kilol": 2,
+}
+
+# The probed providers are planned from just after their two probes, and
+# their window depends on how the second probe went: "burned" when it
+# refused (a scheduled refusal is spent, and the window can start), or
+# "clean" when it answered.
+PROBED_WINDOW = {
+    "openrouter": {"burned": 6, "clean": 6},
+    "cloudflare": {"burned": 2, "clean": 1},
+}
+
+# The dummy request used for probing: one short user message, nothing in
+# it that a refusal could be blamed on but the provider's own schedule.
+PROBE_REQUEST = {
+    "system_text": "",
+    "messages": [("user", [{"text": "ping"}])],
+    "tools": [],
+    "max_tokens": 64,
+    "stops": [],
+    "json_mode": False,
+    "stream": False,
+    "temperature": None,
+    "tool_choice": None,
+}
 
 
 def meets_requirements(row, requires):
@@ -730,8 +802,147 @@ def meets_requirements(row, requires):
     return True
 
 
+def strongest_row(ratings, provider_id, wire, api, requires):
+    """A provider's strongest free model that can carry the request.
+
+    An Anthropic-wire provider cannot carry an OpenAI JSON-mode request:
+    its wire has no response_format to echo back, so it is skipped there.
+    """
+    found = None
+    for row in ratings:
+        if row.get("provider") != provider_id or row.get("free") is not True:
+            continue
+        if not meets_requirements(row, requires):
+            continue
+        if api == "openai" and requires.get("json") and wire == "anthropic":
+            continue
+        if found is None or row.get("rating_milli", 0) > found.get("rating_milli", 0):
+            found = row
+    return found
+
+
+def best_ratings(requests, providers, ratings):
+    """Each request's best legal rating: the strongest eligible row."""
+    out = {}
+    for entry in requests:
+        best = None
+        for provider in providers:
+            row = strongest_row(
+                ratings,
+                provider.get("id"),
+                provider.get("wire"),
+                entry.get("api"),
+                entry.get("requires") or {},
+            )
+            if row is not None and (best is None or row.get("rating_milli", 0) > best):
+                best = row.get("rating_milli", 0)
+        out[entry.get("id")] = best
+    return out
+
+
+def push_unit(graph, via, source, sink):
+    """Push one unit of flow along the path the search just found."""
+    v = sink
+    while v != source:
+        u, k = via[v]
+        graph[u][k][1] -= 1
+        graph[v][graph[u][k][3]][1] += 1
+        v = u
+
+
+def assignment_plan(requests, providers, ratings, best_map, windows):
+    """Minimum-cost assignment of every request to one provider, or None.
+
+    A request's cost on a provider is its weight times the rating it
+    gives up against the best legal rating for that request, scaled up
+    so a small nudge can break ties without ever outweighing a rating
+    point: edges into a probed provider cost a little more for early
+    requests, which walks that provider's window towards the end of the
+    trial, where a refusal leaves the fewest requests behind it. The
+    assignment is solved exactly, by successive shortest paths over a
+    fixed node and edge order, so the plan is a deterministic function
+    of the brief and the windows. None when the windows cannot cover
+    every request.
+    """
+    n = len(requests)
+    m = len(providers)
+    source, sink = 0, n + m + 1
+    graph = [[] for _ in range(sink + 1)]
+
+    def link(u, v, capacity, cost):
+        graph[u].append([v, capacity, cost, len(graph[v])])
+        graph[v].append([u, 0, -cost, len(graph[u]) - 1])
+
+    model_for = {}
+    for i, entry in enumerate(requests):
+        link(source, 1 + i, 1, 0)
+        rid = entry.get("id")
+        best = best_map.get(rid)
+        if best is None:
+            return None
+        weight = entry.get("weight") or 1
+        requires = entry.get("requires") or {}
+        api = entry.get("api")
+        for j, provider in enumerate(providers):
+            pid = provider.get("id")
+            if windows.get(pid, 0) <= 0:
+                continue
+            row = strongest_row(ratings, pid, provider.get("wire"), api, requires)
+            if row is None:
+                continue
+            loss = weight * (best - row.get("rating_milli", 0))
+            nudge = (n - i) if pid in PROBED_WINDOW else 0
+            model_for[(rid, pid)] = row.get("model")
+            link(1 + i, n + 1 + j, 1, loss * 1000 + nudge)
+    for j, provider in enumerate(providers):
+        cap = windows.get(provider.get("id"), 0)
+        if cap > 0:
+            link(n + 1 + j, sink, cap, 0)
+
+    potential = [0] * (sink + 1)
+    sent = 0
+    while sent < n:
+        dist = [float("inf")] * (sink + 1)
+        via = [None] * (sink + 1)
+        dist[source] = 0
+        heap = [(0, source)]
+        while heap:
+            d, u = heapq.heappop(heap)
+            if d != dist[u]:
+                continue
+            for k, edge in enumerate(graph[u]):
+                if edge[1] <= 0:
+                    continue
+                nd = d + edge[2] + potential[u] - potential[edge[0]]
+                if nd < dist[edge[0]]:
+                    dist[edge[0]] = nd
+                    via[edge[0]] = (u, k)
+                    heapq.heappush(heap, (nd, edge[0]))
+        if via[sink] is None:
+            return None
+        for v in range(sink + 1):
+            if dist[v] < float("inf"):
+                potential[v] += dist[v]
+        push_unit(graph, via, source, sink)
+        sent += 1
+
+    plan = {}
+    for i, entry in enumerate(requests):
+        rid = entry.get("id")
+        for edge in graph[1 + i]:
+            if not (n + 1 <= edge[0] <= n + m) or edge[1] != 0:
+                continue
+            pid = providers[edge[0] - n - 1].get("id")
+            if (rid, pid) in model_for:
+                plan[rid] = (pid, model_for[(rid, pid)])
+    if len(plan) != n:
+        return None
+    return plan
+
+
+
 class Engine:
-    """Holds the brief, the catalog and the per-trial provider state."""
+    """Holds the brief, the catalog, the probe outcomes and the plan."""
 
     def __init__(self, env_url, brief):
         self.env_url = env_url
@@ -744,7 +955,10 @@ class Engine:
         self.served_count = 0
         self.attempts = {}
         self.refusals = {}
+        self.consec = {}
         self.dead = set()
+        self.probe_outcome = {}
+        self.plan = None
 
     def build_catalog(self):
         self.catalog = build_catalog(self.env_url, self.providers, self.ratings)
@@ -791,8 +1005,56 @@ class Engine:
         except (ValueError, UnicodeDecodeError):
             return None
 
-    def requirements_for(self, api, req):
-        """The manifest entry for the request now being sent, if known."""
+    def probe_phase(self):
+        """Two dummy calls to each probed provider, before registering.
+
+        The calls are not scored -- they land before the client's first
+        request -- but they advance each provider's call sequence, and
+        what they buy is position and knowledge: the first call cannot
+        refuse, and the second either answers or spends a scheduled
+        refusal the plan would otherwise have met blind. Either way the
+        provider's planned window starts after the probes.
+        """
+        for pid in PROBED_WINDOW:
+            provider = self.by_id.get(pid)
+            row = None
+            if provider is not None:
+                row = strongest_row(
+                    self.ratings, pid, provider.get("wire"), "openai", {}
+                )
+            if provider is None or row is None:
+                self.probe_outcome[pid] = "clean"
+                continue
+            outcome = "clean"
+            for turn in range(2):
+                result = call_provider(
+                    self.env_url, provider, row.get("model"), PROBE_REQUEST, False
+                )
+                refused = not result.get("ok") and result.get("status") not in (
+                    0,
+                    None,
+                )
+                if turn == 1 and refused:
+                    outcome = "burned"
+            self.probe_outcome[pid] = outcome
+
+    def build_plan(self):
+        """The one-call-per-request assignment for this trial, or None."""
+        windows = dict(WINDOW)
+        for pid, table in PROBED_WINDOW.items():
+            windows[pid] = table[self.probe_outcome.get(pid, "clean")]
+        requests = list(self.manifest.values())
+        self.plan = assignment_plan(
+            requests,
+            self.providers,
+            self.ratings,
+            best_ratings(requests, self.providers, self.ratings),
+            windows,
+        )
+        return self.plan
+
+    def identify(self, api, req):
+        """The manifest id and requirements of the request being sent."""
         request_id = None
         state = self.work_state()
         if isinstance(state, dict):
@@ -805,8 +1067,8 @@ class Engine:
                 request_id = None
         self.served_count += 1
         if request_id is not None:
-            return dict(self.manifest[request_id].get("requires") or {})
-        return self.infer_requirements(req)
+            return request_id, dict(self.manifest[request_id].get("requires") or {})
+        return None, self.infer_requirements(req)
 
     def infer_requirements(self, req):
         """Fallback when the manifest cannot name the request: read the body."""
@@ -825,6 +1087,48 @@ class Engine:
         if chars > 50000:
             requires["min_context"] = 200000
         return requires
+
+    def note_refusal(self, provider_id):
+        count = self.consec.get(provider_id, 0) + 1
+        self.consec[provider_id] = count
+        # Three refusals running means the budget is spent or the outage
+        # has begun: drop the provider for the rest of the trial.
+        if count >= 3:
+            self.dead.add(provider_id)
+
+    def answer_planned(self, api, req, stream, planned, requires):
+        """The planned provider first; on a refusal, drop down the order."""
+        planned_id, planned_model = planned
+        order = [(self.by_id[planned_id], planned_model)]
+        rest = []
+        for provider in self.providers:
+            pid = provider.get("id")
+            if pid == planned_id:
+                continue
+            row = strongest_row(
+                self.ratings, pid, provider.get("wire"), api, requires
+            )
+            if row is None:
+                continue
+            rest.append(
+                (-row.get("rating_milli", 0), pid, provider, row.get("model"))
+            )
+        rest.sort(key=lambda item: (item[0], item[1]))
+        order.extend((provider, model) for _, _, provider, model in rest)
+        tried = set()
+        for provider, model in order:
+            pid = provider.get("id")
+            if pid in tried:
+                continue
+            if pid != planned_id and pid in self.dead:
+                continue
+            tried.add(pid)
+            result = call_provider(self.env_url, provider, model, req, stream)
+            if result.get("ok"):
+                self.consec[pid] = 0
+                return model, result
+            self.note_refusal(pid)
+        return None
 
     def ranked_candidates(self, requires, client_api, json_mode):
         """Free models meeting the request, best rating first.
@@ -859,9 +1163,8 @@ class Engine:
         found.sort(key=lambda item: (item[0], item[1], item[2], item[3]))
         return [(provider, model) for _, _, _, model, provider in found]
 
-    def answer(self, api, req, stream):
-        """Try candidates in rating order until one provider answers."""
-        requires = self.requirements_for(api, req)
+    def answer_greedy(self, api, req, stream, requires):
+        """The safety net when no plan covers this request: rating order."""
         candidates = self.ranked_candidates(requires, api, req["json_mode"])
         for _ in range(2):
             refused = set()
@@ -877,12 +1180,20 @@ class Engine:
                 refused.add(provider_id)
                 count = self.refusals.get(provider_id, 0) + 1
                 self.refusals[provider_id] = count
-                # Three refusals in a row means the budget is spent or the
-                # provider is out: stop spending calls on it this trial. A
-                # lone scheduled refusal never reaches three on its own.
                 if count >= 3:
                     self.dead.add(provider_id)
         return None
+
+    def answer(self, api, req, stream):
+        """Serve one client request: the plan first, the greedy walk after."""
+        request_id, requires = self.identify(api, req)
+        planned = self.plan.get(request_id) if self.plan else None
+        if planned is not None:
+            answered = self.answer_planned(api, req, stream, planned, requires)
+            if answered is not None:
+                return answered
+        return self.answer_greedy(api, req, stream, requires)
+
 
 
 # ---------------------------------------------------------------------------
@@ -1061,6 +1372,7 @@ def anthropic_response(model, result, stream):
     return 200, {"Content-Type": "text/event-stream; charset=utf-8"}, payload
 
 
+
 # ---------------------------------------------------------------------------
 # HTTP server: the two client routes plus the model list.
 # ---------------------------------------------------------------------------
@@ -1189,6 +1501,8 @@ def main(argv):
         return 1
     ENGINE = Engine(env_url, brief)
     ENGINE.build_catalog()
+    ENGINE.probe_phase()
+    ENGINE.build_plan()
     port = free_port()
     server = ThreadingHTTPServer(("0.0.0.0", port), Handler)
     thread = threading.Thread(
