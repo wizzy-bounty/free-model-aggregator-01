@@ -1,74 +1,45 @@
-# free-model-aggregator-01
+# Free Model Aggregator
 
-Entry for the make.fun competition **free-model-aggregator-01** ("The best
-free AI model aggregator", harness agent/v1). One Python file, standard
-library only.
+One server that answers the OpenAI Chat Completions API and the Anthropic
+Messages API — in JSON and in streaming — by routing every request to the
+best free model across ten simulated free-tier providers.
 
-## What it does
+## How it works
 
-`main.py` reads the trial brief at `$MAKEFUN_PROMPT_FILE` — the provider
-directory, the quality table, and the workload manifest — probes every
-provider's own catalog route on its own wire with its own auth, and registers
-the resulting catalog with the env at `$MAKEFUN_ENV_URL`.
+- The server reads its brief (`MAKEFUN_PROMPT_FILE`): the ten providers,
+  the sealed quality table and the workload manifest.
+- At startup it asks each provider for its own model list and builds one
+  catalog document from the answers, then registers its port and that
+  catalog with the trial env.
+- For each incoming request it looks up what the request needs (tools,
+  vision, JSON mode, minimum context) and picks the highest-rated free
+  model that meets those needs. A provider that refuses with 402 or 429
+  costs nothing but a retry: the next best candidate serves the request.
+- Requests are translated into the chosen provider's own wire — OpenAI,
+  Anthropic or Gemini — keeping the system prompt, user text, images,
+  tools, stop sequences, `max_tokens` and JSON mode exactly as the client
+  sent them, so the provider echoes them back unchanged. Answers come back
+  in the wire the client used, with the provider's text whole and its usage
+  counts as reported.
+- `GET /v1/models` answers in the wire the auth header names: a Bearer
+  token gets the OpenAI list, an `x-api-key` gets the Anthropic list, both
+  listing exactly the free models in the registered catalog.
+- When the env says the workload is done, the server exits 0.
 
-It then serves the two client wires:
+## Running it
 
-- `GET /v1/models` — exactly the registered free model ids, answered in the
-  envelope of whichever auth style the client uses.
-- `POST /v1/chat/completions` (OpenAI) and `POST /v1/messages` (Anthropic),
-  each in plain JSON or SSE streaming form.
-
-## Routing
-
-For each request, the manifest's requirements (tools, vision, JSON mode,
-minimum context) filter the free models; the survivors are ranked by the
-quality table's rating. The best candidate is called on its provider's wire
-with its provider's auth, the request translated so the provider parses the
-same system text, user text, tool names, `max_tokens`, stop sequences, image
-and JSON mode the client sent — providers echo what they parsed, and the
-client compares the echo, so translation fidelity is the wire score. A
-402/429/5xx refusal fails over to the next candidate; provider calls are
-serialized per provider (one provider serves one call at a time) and budgets
-are never spent on a paid model or a wrong key.
-
-The provider's answer text, usage and stop reason are returned verbatim in
-the client's wire — JSON or synthesized SSE — with stop reasons mapped
-between the wire families.
-
-## Transport failures vs refusals
-
-A call that never reaches the provider (timeout, reset, DNS) is neither a
-success nor a refusal: `Provider.note_attempt()` counts the attempt but
-leaves the consecutive-refusal streak untouched. A timeout must not clear
-the evidence that a provider is dead, nor condemn a provider that is
-merely slow.
-
-## Determinism
-
-Every decision derives from the brief, the requests and the providers'
-answers. No wall clock feeds a decision (timestamps come from
-`$MAKEFUN_TRIAL_NOW`), there is no randomness, and responses carry no
-`Date` header, so a replayed trial produces a byte-identical state export.
-
-## Usage
-
-```
-MAKEFUN_PROMPT_FILE=<brief> MAKEFUN_ENV_URL=http://127.0.0.1:<port> \
-MAKEFUN_TRIAL_SEED=<seed> MAKEFUN_TRIAL_NOW=<iso> python3 main.py
-python3 main.py --list   # prints the catalog document
+```sh
+python3 main.py            # serve a trial (needs MAKEFUN_PROMPT_FILE
+                           # and MAKEFUN_ENV_URL from the trial env)
+python3 main.py --list     # print the catalog document and exit 0
 ```
 
-## Practice scores
+Python 3.13, standard library only — nothing to install. Every routing
+choice is a function of the brief, the requests and the providers' answers,
+so a replay of the same trial leaves the same state export.
 
-Local practice against the kit's real env + scorer (`grade-local`,
-`--driver process`):
+## Layout
 
-| trial | quality | served | wire | failover | catalog | total |
-|-------|--------:|-------:|-----:|---------:|--------:|------:|
-| 0     |      99 |    100 |  100 |      100 |     100 |    99 |
-| 1     |      99 |    100 |  100 |      100 |     100 |    99 |
-| 2     |      99 |    100 |  100 |      100 |     100 |    99 |
-
-Quality 99 is the structural ceiling of the provider budget in the
-practice instances; every other column is 100. State exports are
-byte-identical across repeated runs of the same trial.
+- `main.py` — the whole server.
+- `.makefun/owner.json` — the claim file naming the payout wallet.
+- `LICENSE` — MIT.
